@@ -213,6 +213,13 @@ REDIS_HOST=localhost mvn verify
 
 ## Deployment
 
-The DigitalOcean deployment uses one Droplet with Caddy, HAProxy, two Spring Boot containers, and Redis. The public URL is `https://68-183-94-203.sslip.io`; `/v1/**` requires a bearer key. HAProxy and Redis are not directly exposed publicly. The Droplet is provisioned with 2 vCPUs and 4 GB RAM; this is host capacity, not measured application usage.
+The DigitalOcean deployment uses one Droplet with Caddy, HAProxy, two Spring Boot containers, and Redis. The public URL is `https://68-183-94-203.sslip.io`; `/v1/**` requires a bearer key. HAProxy and Redis are not directly exposed publicly.
+
+### Provisioned Droplet capacity
+
+- **CPU:** 2 vCPUs
+- **Memory:** 4 GB RAM
+
+These are host capacity figures, not measured application consumption.
 
 The app key is mandatory in the server’s untracked `/opt/rate-limiter/.env`. Caddy obtains and renews the HTTPS certificate. The Droplet is a single-host failure domain and is billable while active. Do not remove bearer authentication or expose the internal app/Redis ports.
