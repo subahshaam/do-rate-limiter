@@ -12,23 +12,118 @@ A Java 21 / Spring Boot REST API for per-tenant, per-resource quotas. It support
 
 ```mermaid
 flowchart LR
-  Client -->|HTTPS + bearer key| Caddy[Caddy / TLS]
-  Caddy --> HAProxy
+  Client -->|API request + bearer key| HAProxy
   HAProxy --> App1[Spring Boot replica 1]
   HAProxy --> App2[Spring Boot replica 2]
   App1 --> Redis[(Shared Redis)]
   App2 --> Redis
 ```
 
-Caddy terminates HTTPS. HAProxy distributes requests to both application containers. Both replicas use the same Redis instance for rules and quota state. See [docs/architecture.md](docs/architecture.md) for request and rule-update flows.
+HAProxy distributes requests to both application containers. Both replicas use the same Redis instance for rules and quota state. See [docs/architecture.md](docs/architecture.md) for request and rule-update flows.
 
 ## LLD
 
-### API
+### Class diagram
+
+```mermaid
+classDiagram
+  direction LR
+
+  class ApiKeyFilter {
+    +doFilterInternal(request, response, chain)
+  }
+  class RateLimitController {
+    +evaluate(request) EvaluationResponse
+    +quota(tenantId, resource) EvaluationResponse
+    +listRules() List~RateLimitRule~
+    +getRule(tenantId, resource) RateLimitRule
+    +createRule(rule) RateLimitRule
+    +updateRule(tenantId, resource, rule) RateLimitRule
+    +deleteRule(tenantId, resource) ResponseEntity
+  }
+  class RateLimitService {
+    +saveRule(rule) RateLimitRule
+    +deleteRule(tenantId, resource) boolean
+    +listRules() List~RateLimitRule~
+    +getRule(tenantId, resource) RateLimitRule
+    +evaluate(tenantId, resource) EvaluationResponse
+    +getQuota(tenantId, resource) EvaluationResponse
+  }
+  class EvaluationRequest {
+    +tenantId: String
+    +resource: String
+  }
+  class EvaluationResponse {
+    +allowed: boolean
+    +remaining: long
+    +resetAt: long
+  }
+  class RateLimitRule {
+    +tenantId: String
+    +resource: String
+    +algorithm: RateLimitAlgorithm
+    +sustainedLimit: int
+    +burstCapacity: int
+    +windowSeconds: long
+  }
+  class RateLimitAlgorithm {
+    <<enumeration>>
+    FIXED_WINDOW
+    TOKEN_BUCKET
+  }
+  class QuotaSnapshotCalculator
+  class RuleNotFoundException
+  class ApiExceptionHandler
+  class RedisConnectionFailureException
+  class RedisConfiguration
+  class StringRedisTemplate
+
+  ApiKeyFilter ..> RateLimitController : authenticates before request handling
+  RateLimitController --> RateLimitService : delegates
+  RateLimitController ..> EvaluationRequest : accepts
+  RateLimitController ..> EvaluationResponse : returns
+  RateLimitService ..> RateLimitRule : reads and writes
+  RateLimitService ..> RateLimitAlgorithm : selects algorithm
+  RateLimitService ..> EvaluationResponse : creates
+  RateLimitService ..> QuotaSnapshotCalculator : computes read-only snapshot
+  RateLimitService ..> RuleNotFoundException : throws
+  RateLimitService --> StringRedisTemplate : accesses rules and quota state
+  RedisConfiguration ..> StringRedisTemplate : configures
+  RateLimitRule --> RateLimitAlgorithm : uses
+  ApiExceptionHandler ..> RedisConnectionFailureException : maps to HTTP 503
+```
+
+### Rate-limit evaluation
+
+The primary rate-limiting endpoint is `POST /v1/evaluate`. It checks the quota for a `(tenantId, resource)` pair and atomically updates its shared Redis state. Public requests require a bearer API key.
+
+**Public URL:** `POST https://68-183-94-203.sslip.io/v1/evaluate`
+
+```bash
+curl -sS -X POST "https://68-183-94-203.sslip.io/v1/evaluate" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"tenantId":"tenant-a","resource":"search"}'
+```
+
+Request:
+
+```json
+{"tenantId":"tenant-a","resource":"search"}
+```
+
+Response:
+
+```json
+{"allowed":true,"remaining":9,"resetAt":1795241224075}
+```
+
+`allowed` tells the caller whether to proceed, `remaining` is the available quota, and `resetAt` is a Unix epoch timestamp in milliseconds. By default, the service uses a token bucket with a sustained limit of 10 requests per 60 seconds and a burst capacity of 20.
+
+### Quota and rule endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/evaluate` | Consume quota and return allow/deny, remaining capacity, and reset time |
 | `GET` | `/v1/quota/{tenantId}/{resource}` | Inspect quota state without consuming quota |
 | `GET` | `/v1/rules` | List configured rules |
 | `GET` | `/v1/rules/{tenantId}/{resource}` | Read one rule |
@@ -36,19 +131,7 @@ Caddy terminates HTTPS. HAProxy distributes requests to both application contain
 | `PUT` | `/v1/rules/{tenantId}/{resource}` | Update a rule |
 | `DELETE` | `/v1/rules/{tenantId}/{resource}` | Delete a rule and its quota state |
 
-Evaluation request:
-
-```json
-{"tenantId":"tenant-a","resource":"search"}
-```
-
-Evaluation response:
-
-```json
-{"allowed":true,"remaining":9,"resetAt":1795241224075}
-```
-
-`resetAt` is Unix epoch time in milliseconds. Rules contain `algorithm`, `sustainedLimit`, `burstCapacity`, and `windowSeconds`. Without an explicit rule, the default is token bucket: 10 requests per 60 seconds with burst capacity 20.
+Rule configuration includes `algorithm`, `sustainedLimit`, `burstCapacity`, and `windowSeconds`.
 
 ### Algorithms and Redis state
 
@@ -56,6 +139,56 @@ Evaluation response:
 - **Token bucket:** Redis stores token balance and last-refill time. Tokens replenish at `sustainedLimit / windowSeconds`, up to `burstCapacity`.
 - Rule values are stored under `rate-limit:rule:*`; quota state is stored under `rate-limit:state:*`.
 - A Lua script performs each evaluation’s read/check/update atomically in Redis. Redis serializes script execution, bounding contention to that single operation.
+
+## Redis and Data Storage
+
+Quota and rule data are scoped by the `(tenantId, resource)` pair. Each pair gets its own rule key and quota-state key; different tenants do not consume one another's capacity, while both application replicas use the same Redis keys for the same pair.
+
+| Redis key | Stored data |
+|---|---|
+| `rate-limit:rule:{tenantId}:{resource}` | JSON-serialized rule configuration |
+| `rate-limit:rules` | Set indexing configured rule keys for listing |
+| `rate-limit:state:{tenantId}:{resource}` | Current algorithm state |
+
+Fixed-window state stores a request `count` and window `reset` timestamp; the key expires at the reset boundary. Token-bucket state stores the current `tokens` and last `updated` timestamp, with a 24-hour idle expiry. Redis Lua scripts atomically read and update this state, so replicas cannot race by maintaining separate local counters. Rule reads are not cached.
+
+### Example Redis values
+
+For `tenant-a/search`, a configured rule is stored as a JSON string, and its key is added to the `rate-limit:rules` set. For example:
+
+```text
+GET rate-limit:rule:tenant-a:search
+{"tenantId":"tenant-a","resource":"search","algorithm":"FIXED_WINDOW","sustainedLimit":3,"burstCapacity":3,"windowSeconds":60}
+```
+
+The state key is a Redis hash. With that fixed-window rule, after two allowed requests it can look like this:
+
+```text
+TYPE rate-limit:state:tenant-a:search
+hash
+
+HGETALL rate-limit:state:tenant-a:search
+1) "count"
+2) "2"
+3) "reset"
+4) "1795241224075"
+```
+
+`reset` is the window reset time in Unix milliseconds. The third allowed request brings `count` to `3`; further requests are denied without increasing it. The state key expires at the reset boundary.
+
+For a fresh token bucket with the default capacity of 20, its first allowed request leaves one token consumed:
+
+```text
+HGETALL rate-limit:state:tenant-a:search
+1) "tokens"
+2) "19"
+3) "updated"
+4) "1795241224075"
+```
+
+`updated` is the last evaluation time in Unix milliseconds. This state key has a 24-hour idle expiry. The timestamps above are illustrative; actual values depend on request time. The hash fields differ by algorithm, so the two state examples are alternatives for the same tenant/resource key.
+
+Compose enables Redis AOF persistence and stores its files in the `redis_data` volume. This survives container restarts, but does not provide replication, failover, or an off-host backup. Deleting a rule also deletes that tenant/resource pair's quota state.
 
 ## Monitoring
 
