@@ -134,9 +134,9 @@ Response:
 
 Rule configuration includes `algorithm`, `sustainedLimit`, `burstCapacity`, and `windowSeconds`.
 
-### Strategy pattern
+### Suggested Strategy pattern (not implemented)
 
-Each tenant/resource rule selects a rate-limiting algorithm: `FIXED_WINDOW` or `TOKEN_BUCKET`. The current `RateLimitService` uses `RateLimitAlgorithm` to dispatch to the corresponding Redis Lua script; it does not yet use separate Strategy classes. If more algorithms are added, each can be extracted behind a common strategy interface, allowing new policies without expanding the service's conditional logic.
+Each tenant/resource rule selects `FIXED_WINDOW` or `TOKEN_BUCKET`. Today, `RateLimitService` uses `RateLimitAlgorithm` and a conditional to dispatch to the corresponding Redis Lua script. A Strategy-pattern refactor could introduce a `RateLimitStrategy` interface, with `FixedWindowStrategy` and `TokenBucketStrategy` implementations owning their algorithm-specific evaluation. `RateLimitService` would select the implementation for the rule and delegate to it. This is a suggested design; the current code does not yet contain these strategy classes.
 
 ### Algorithms and Redis state
 
