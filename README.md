@@ -4,6 +4,7 @@
 
 A Java 21 / Spring Boot REST API for per-tenant, per-resource quotas. It supports fixed-window and token-bucket rules, stores shared state in Redis, and uses atomic Lua scripts so concurrent requests across app replicas cannot overspend quota.
 
+- Rate limiting: token bucket is the default (10 requests per 60 seconds, burst 20); fixed window is also supported through rule configuration.
 - Public endpoint: `https://68-183-94-203.sslip.io`
 - Public API routes require `Authorization: Bearer <API_KEY>`.
 - Source and CI: [subahshaam/do-rate-limiter](https://github.com/subahshaam/do-rate-limiter)
@@ -132,6 +133,10 @@ Response:
 | `DELETE` | `/v1/rules/{tenantId}/{resource}` | Delete a rule and its quota state |
 
 Rule configuration includes `algorithm`, `sustainedLimit`, `burstCapacity`, and `windowSeconds`.
+
+### Strategy pattern
+
+Each tenant/resource rule selects a rate-limiting algorithm: `FIXED_WINDOW` or `TOKEN_BUCKET`. The current `RateLimitService` uses `RateLimitAlgorithm` to dispatch to the corresponding Redis Lua script; it does not yet use separate Strategy classes. If more algorithms are added, each can be extracted behind a common strategy interface, allowing new policies without expanding the service's conditional logic.
 
 ### Algorithms and Redis state
 
