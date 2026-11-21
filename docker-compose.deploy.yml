@@ -18,6 +18,8 @@ services:
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      SPRING_PROFILES_ACTIVE: public
+      RATE_LIMIT_API_KEY: ${RATE_LIMIT_API_KEY:?Set RATE_LIMIT_API_KEY in .env}
     depends_on:
       redis:
         condition: service_healthy
@@ -36,6 +38,8 @@ services:
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      SPRING_PROFILES_ACTIVE: public
+      RATE_LIMIT_API_KEY: ${RATE_LIMIT_API_KEY:?Set RATE_LIMIT_API_KEY in .env}
     depends_on:
       redis:
         condition: service_healthy
@@ -60,5 +64,20 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - proxy
+    restart: unless-stopped
+
 volumes:
   redis_data:
+  caddy_data:
+  caddy_config:

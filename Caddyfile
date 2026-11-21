@@ -1,0 +1,4 @@
+68-183-94-203.sslip.io {
+    encode gzip
+    reverse_proxy proxy:8080
+}
