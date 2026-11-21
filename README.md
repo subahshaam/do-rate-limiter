@@ -152,41 +152,25 @@ Quota and rule data are scoped by the `(tenantId, resource)` pair. Each pair get
 
 Fixed-window state stores a request `count` and window `reset` timestamp; the key expires at the reset boundary. Token-bucket state stores the current `tokens` and last `updated` timestamp, with a 24-hour idle expiry. Redis Lua scripts atomically read and update this state, so replicas cannot race by maintaining separate local counters. Rule reads are not cached.
 
-### Example Redis values
+### Example structures
 
-For `tenant-a/search`, a configured rule is stored as a JSON string, and its key is added to the `rate-limit:rules` set. For example:
+Rule:
 
-```text
-GET rate-limit:rule:tenant-a:search
+```json
 {"tenantId":"tenant-a","resource":"search","algorithm":"FIXED_WINDOW","sustainedLimit":3,"burstCapacity":3,"windowSeconds":60}
 ```
 
-The state key is a Redis hash. With that fixed-window rule, after two allowed requests it can look like this:
+Fixed-window state:
 
-```text
-TYPE rate-limit:state:tenant-a:search
-hash
-
-HGETALL rate-limit:state:tenant-a:search
-1) "count"
-2) "2"
-3) "reset"
-4) "1795241224075"
+```json
+{"count":2,"reset":1795241224075}
 ```
 
-`reset` is the window reset time in Unix milliseconds. The third allowed request brings `count` to `3`; further requests are denied without increasing it. The state key expires at the reset boundary.
+Token-bucket state:
 
-For a fresh token bucket with the default capacity of 20, its first allowed request leaves one token consumed:
-
-```text
-HGETALL rate-limit:state:tenant-a:search
-1) "tokens"
-2) "19"
-3) "updated"
-4) "1795241224075"
+```json
+{"tokens":19,"updated":1795241224075}
 ```
-
-`updated` is the last evaluation time in Unix milliseconds. This state key has a 24-hour idle expiry. The timestamps above are illustrative; actual values depend on request time. The hash fields differ by algorithm, so the two state examples are alternatives for the same tenant/resource key.
 
 Compose enables Redis AOF persistence and stores its files in the `redis_data` volume. This survives container restarts, but does not provide replication, failover, or an off-host backup. Deleting a rule also deletes that tenant/resource pair's quota state.
 
@@ -224,6 +208,6 @@ REDIS_HOST=localhost mvn verify
 
 ## Deployment
 
-The DigitalOcean deployment uses one Droplet with Caddy, HAProxy, two Spring Boot containers, and Redis. The public URL is `https://68-183-94-203.sslip.io`; `/v1/**` requires a bearer key. HAProxy and Redis are not directly exposed publicly.
+The DigitalOcean deployment uses one Droplet with Caddy, HAProxy, two Spring Boot containers, and Redis. The public URL is `https://68-183-94-203.sslip.io`; `/v1/**` requires a bearer key. HAProxy and Redis are not directly exposed publicly. The Droplet is provisioned with 2 vCPUs and 4 GB RAM; this is host capacity, not measured application usage.
 
 The app key is mandatory in the server’s untracked `/opt/rate-limiter/.env`. Caddy obtains and renews the HTTPS certificate. The Droplet is a single-host failure domain and is billable while active. Do not remove bearer authentication or expose the internal app/Redis ports.
