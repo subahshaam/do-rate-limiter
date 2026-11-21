@@ -13,14 +13,17 @@ A Java 21 / Spring Boot REST API for per-tenant, per-resource quotas. It support
 
 ```mermaid
 flowchart LR
-  Client -->|API request + bearer key| HAProxy
-  HAProxy --> App1[Spring Boot replica 1]
-  HAProxy --> App2[Spring Boot replica 2]
-  App1 --> Redis[(Shared Redis)]
-  App2 --> Redis
+  Client -->|API request + bearer key| LB[HAProxy Load Balancer]
+
+  subgraph Droplet[DigitalOcean Droplet]
+    LB --> App1[Spring Boot replica 1]
+    LB --> App2[Spring Boot replica 2]
+    App1 --> Redis[(Shared Redis)]
+    App2 --> Redis
+  end
 ```
 
-HAProxy distributes requests to both application containers. Both replicas use the same Redis instance for rules and quota state. See [docs/architecture.md](docs/architecture.md) for request and rule-update flows.
+HAProxy is the load balancer and distributes requests to both Spring Boot replicas. The load balancer, both app containers, and Redis run on one DigitalOcean Droplet; both replicas share Redis for rules and quota state. See [docs/architecture.md](docs/architecture.md) for request and rule-update flows.
 
 ## LLD
 
