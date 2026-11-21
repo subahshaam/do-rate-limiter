@@ -1,59 +1,96 @@
 # Distributed Rate Limiter
 
-Java 21 / Spring Boot REST API using Redis Lua scripts for atomic, shared quota decisions across replicas.
+## Summary / Deliverable
 
-## Run and test locally
+A Java 21 / Spring Boot REST API for per-tenant, per-resource quotas. It supports fixed-window and token-bucket rules, stores shared state in Redis, and uses atomic Lua scripts so concurrent requests across app replicas cannot overspend quota.
 
-Start Redis, then run unit and Redis-backed HTTP integration tests:
+- Public endpoint: `https://68-183-94-203.sslip.io`
+- Public API routes require `Authorization: Bearer <API_KEY>`.
+- Source and CI: [subahshaam/do-rate-limiter](https://github.com/subahshaam/do-rate-limiter)
+
+## HLD
+
+```mermaid
+flowchart LR
+  Client -->|HTTPS + bearer key| Caddy[Caddy / TLS]
+  Caddy --> HAProxy
+  HAProxy --> App1[Spring Boot replica 1]
+  HAProxy --> App2[Spring Boot replica 2]
+  App1 --> Redis[(Shared Redis)]
+  App2 --> Redis
+```
+
+Caddy terminates HTTPS. HAProxy distributes requests to both application containers. Both replicas use the same Redis instance for rules and quota state. See [docs/architecture.md](docs/architecture.md) for request and rule-update flows.
+
+## LLD
+
+### API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/evaluate` | Consume quota and return allow/deny, remaining capacity, and reset time |
+| `GET` | `/v1/quota/{tenantId}/{resource}` | Inspect quota state without consuming quota |
+| `GET` | `/v1/rules` | List configured rules |
+| `GET` | `/v1/rules/{tenantId}/{resource}` | Read one rule |
+| `POST` | `/v1/rules` | Create a rule |
+| `PUT` | `/v1/rules/{tenantId}/{resource}` | Update a rule |
+| `DELETE` | `/v1/rules/{tenantId}/{resource}` | Delete a rule and its quota state |
+
+Evaluation request:
+
+```json
+{"tenantId":"tenant-a","resource":"search"}
+```
+
+Evaluation response:
+
+```json
+{"allowed":true,"remaining":9,"resetAt":1795241224075}
+```
+
+`resetAt` is Unix epoch time in milliseconds. Rules contain `algorithm`, `sustainedLimit`, `burstCapacity`, and `windowSeconds`. Without an explicit rule, the default is token bucket: 10 requests per 60 seconds with burst capacity 20.
+
+### Algorithms and Redis state
+
+- **Fixed window:** Redis stores a request counter and reset timestamp. It is simple, but may allow bursts on adjacent window boundaries. `burstCapacity` is unused for this algorithm.
+- **Token bucket:** Redis stores token balance and last-refill time. Tokens replenish at `sustainedLimit / windowSeconds`, up to `burstCapacity`.
+- Rule values are stored under `rate-limit:rule:*`; quota state is stored under `rate-limit:state:*`.
+- A Lua script performs each evaluation’s read/check/update atomically in Redis. Redis serializes script execution, bounding contention to that single operation.
+
+## Monitoring
+
+Spring Boot Actuator exposes:
+
+- `/actuator/health` — overall health, including Redis.
+- `/actuator/health/readiness` — readiness; includes Redis health.
+- `/actuator/health/liveness` — process liveness.
+
+Health routes are public for probes. Missing or invalid API keys receive HTTP `401`. If Redis is unavailable, the service fails closed with HTTP `503` and `REDIS_UNAVAILABLE`. No metrics or tracing backend is configured in this demo.
+
+## Maintainability
+
+- `src/main/java/com/example/demo/RateLimitController.java` — HTTP API.
+- `RateLimitService.java` — Redis rule/state access and Lua evaluations.
+- `ApiKeyFilter.java` — bearer-key enforcement in the `public` profile.
+- `QuotaSnapshotCalculator.java` — quota snapshot calculations.
+- `src/test/java/com/example/demo/` — unit and HTTP/Redis integration tests.
+- `docker-compose.deploy.yml`, `Dockerfile`, and `Caddyfile` — deployment stack.
+- `.github/workflows/ci.yml` — CI test and package pipeline.
+
+The API key is supplied via `RATE_LIMIT_API_KEY` and must be kept in an untracked `.env` file on the server. Never commit it or put it in a URL. The current deployment runs all containers on one Droplet; Redis replication/failover and multi-host availability are not configured. Rule reads are not cached.
+
+## Test
+
+Run tests with Java 21, Maven, and a Redis instance available at the configured `REDIS_HOST`/`REDIS_PORT`:
 
 ```bash
-docker compose -f docker-compose.deploy.yml up -d redis
 REDIS_HOST=localhost mvn verify
 ```
 
-Run the complete local stack (two app replicas, Redis, and HAProxy):
+`mvn verify` runs algorithm boundary/refill unit tests, HTTP controller tests, Redis-backed CRUD and concurrency tests, Redis-unavailable behavior tests, and public-profile API-key tests. GitHub Actions starts Redis, runs the same verification, and packages the application on pushes and pull requests.
 
-```bash
-docker compose -f docker-compose.deploy.yml up --build -d
-curl http://localhost:8080/actuator/health
-```
+## Deployment
 
-HAProxy listens on loopback only. To stop the stack, run `docker compose -f docker-compose.deploy.yml down`.
+The DigitalOcean deployment uses one Droplet with Caddy, HAProxy, two Spring Boot containers, and Redis. The public URL is `https://68-183-94-203.sslip.io`; `/v1/**` requires a bearer key. HAProxy and Redis are not directly exposed publicly.
 
-## API examples
-
-Create a rule:
-
-```bash
-curl -X POST http://localhost:8080/v1/rules \
-  -H 'Content-Type: application/json' \
-  -d '{"tenantId":"tenant-a","resource":"search","algorithm":"FIXED_WINDOW","sustainedLimit":10,"burstCapacity":20,"windowSeconds":60}'
-```
-
-Evaluate:
-
-```bash
-curl -X POST http://localhost:8080/v1/evaluate \
-  -H 'Content-Type: application/json' \
-  -d '{"tenantId":"tenant-a","resource":"search"}'
-```
-
-Other endpoints: `GET /v1/quota/{tenantId}/{resource}`, `GET /v1/rules`, `GET /v1/rules/{tenantId}/{resource}`, `PUT /v1/rules/{tenantId}/{resource}`, and `DELETE /v1/rules/{tenantId}/{resource}`.
-
-## Algorithm selection
-
-- **Fixed window** increments a counter atomically and resets it after `windowSeconds`. It is simple and inexpensive, but allows bursts at adjacent window boundaries.
-- **Token bucket** starts with `burstCapacity` tokens and replenishes at `sustainedLimit / windowSeconds`. It permits short bursts while smoothing sustained traffic.
-- When no explicit tenant/resource rule exists, the service uses a token bucket with sustained limit 10 per 60 seconds and burst capacity 20.
-
-## Shared-state correctness and failure behavior
-
-Each app replica reads the active rule from Redis and invokes a Redis Lua script for the counter/token update. Redis executes each script atomically, bounding the race window to a single serialized script operation. The concurrent integration test submits requests through the HTTP layer and asserts that no more than the configured capacity is allowed.
-
-Redis is required for rule storage and quota evaluation. The service fails closed when Redis is unavailable: it returns `503` with `REDIS_UNAVAILABLE` rather than making an allow decision from local state. Readiness includes Redis health; liveness only reports process health.
-
-## Deployment and known limitations
-
-The deployment Compose file runs two Spring Boot containers, Redis with AOF, and HAProxy. The app containers share Redis; the proxy binds to `127.0.0.1:8080`. This demonstrates cross-replica correctness, but all services on a single Droplet remain a single-host failure domain. Redis replication/failover, backup restore, TLS, API authentication/authorization, and production access controls are not configured. Do not expose the current API publicly without adding those controls.
-
-See [docs/architecture.md](docs/architecture.md) for request flow and rule/evaluation lifecycle. GitHub Actions starts Redis, runs tests, and packages the application on pushes and pull requests.
+The app key is mandatory in the server’s untracked `/opt/rate-limiter/.env`. Caddy obtains and renews the HTTPS certificate. The Droplet is a single-host failure domain and is billable while active. Do not remove bearer authentication or expose the internal app/Redis ports.
